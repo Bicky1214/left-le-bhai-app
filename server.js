@@ -11,7 +11,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // IMPORTANT: Configure CORS to allow requests from any origin.
-// This is necessary for the frontend on Netlify to communicate with the backend on Render.
 app.use(cors({
     origin: '*' // Allow all origins
 }));
@@ -20,15 +19,16 @@ app.use(express.json());
 
 // --- CONSTANTS AND CONFIGURATION ---
 const OVERPASS_API_URL = 'https://overpass-api.de/api/interpreter';
-// Define highway types suitable for driving
 const HIGHWAY_FILTER = `[highway~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link|living_street|service)$"]`;
+
 // Turn angle definitions (in degrees)
-const LEFT_TURN_ANGLE_MIN = -150; // -30 to -150 degrees is a left turn
+const LEFT_TURN_ANGLE_MIN = -150;
 const LEFT_TURN_ANGLE_MAX = -30;
-const STRAIGHT_ANGLE_THRESHOLD = 30; // Anything within +/- 30 degrees is "straight"
+const RIGHT_TURN_ANGLE_MIN = 30;
+const RIGHT_TURN_ANGLE_MAX = 150;
+const STRAIGHT_ANGLE_THRESHOLD = 30;
 
 // --- PRIORITY QUEUE IMPLEMENTATION ---
-// A simple min-priority queue for the A* algorithm's open set.
 class PriorityQueue {
     constructor() {
         this.elements = [];
@@ -60,41 +60,54 @@ app.post('/route', async (req, res) => {
         console.log('1. Fetching OSM data...');
         const osmData = await fetchOsmData(start, end);
         if (!osmData.elements || osmData.elements.length === 0) {
-            return res.status(404).json({ message: 'Could not fetch map data for the specified area. Try a different location.' });
+            return res.status(404).json({ message: 'Could not fetch map data for the specified area.' });
         }
 
         console.log('2. Building graph...');
         const { graph, nodes } = buildGraph(osmData);
 
-        console.log('3. Finding closest nodes to start/end points...');
         const startNodeId = findClosestNode(start, nodes);
         const endNodeId = findClosestNode(end, nodes);
         if (!startNodeId || !endNodeId) {
             return res.status(404).json({ message: 'Could not map start/end points to the road network.' });
         }
         
-        console.log(`4. Running A* from ${startNodeId} to ${endNodeId}...`);
-        const resultPath = findPath(startNodeId, endNodeId, graph, nodes);
+        // --- Multi-stage pathfinding ---
+        let resultPath = null;
+        
+        // Attempt 1: Strict left-turn only
+        console.log('4a. Running A* (Attempt 1: Strict Left/Straight)...');
+        resultPath = findPath(startNodeId, endNodeId, graph, nodes, {
+            allowLeft: true, allowStraight: true, allowRight: false, allowUTurn: false
+        });
+
+        // Attempt 2: Allow U-Turns if first attempt fails
+        if (!resultPath) {
+            console.log('4b. Running A* (Attempt 2: Allowing U-Turns)...');
+            resultPath = findPath(startNodeId, endNodeId, graph, nodes, {
+                allowLeft: true, allowStraight: true, allowRight: false, allowUTurn: true
+            });
+        }
+        
+        // Attempt 3: Allow Right Turns as a last resort
+        if (!resultPath) {
+            console.log('4c. Running A* (Attempt 3: Allowing Right Turns)...');
+            resultPath = findPath(startNodeId, endNodeId, graph, nodes, {
+                allowLeft: true, allowStraight: true, allowRight: true, allowUTurn: true
+            });
+        }
 
         if (!resultPath) {
-            return res.status(404).json({ message: 'No valid left-turn-only path could be found. This can happen in areas with many one-way streets or where no such path exists.' });
+            return res.status(404).json({ message: 'No valid path could be found, even with relaxed turn constraints.' });
         }
         
         console.log('5. Path found! Reconstructing and sending response.');
-        // Reconstruct path with full coordinate objects
         const detailedPath = resultPath.path.map(id => ({ lat: nodes[id].lat, lon: nodes[id].lon }));
-        
-        // Add start and end coordinates to the path extremities for precise visualization
-        const finalPath = [
-            { lat: start.lat, lng: start.lng },
-            ...detailedPath.map(p => ({ lat: p.lat, lng: p.lon })),
-            { lat: end.lat, lng: end.lng }
-        ];
-
+        const finalPath = [ { lat: start.lat, lng: start.lng }, ...detailedPath.map(p => ({ lat: p.lat, lng: p.lon })), { lat: end.lat, lng: end.lng } ];
         res.json({ path: finalPath, distance: resultPath.distance });
 
     } catch (error) {
-        console.error('Error on /route:', error.message);
+        console.error('Error on /route:', error.stack);
         res.status(500).json({ message: 'An internal server error occurred.' });
     }
 });
@@ -102,44 +115,18 @@ app.post('/route', async (req, res) => {
 
 // --- CORE LOGIC ---
 
-/**
- * Fetches OSM road network data for a given bounding box.
- * @param {object} start - {lat, lng} for start point.
- * @param {object} end - {lat, lng} for end point.
- * @returns {Promise<object>} The OSM data from Overpass API.
- */
 async function fetchOsmData(start, end) {
-    // Create a bounding box with a buffer
     const buffer = 0.05; 
-    const minLat = Math.min(start.lat, end.lat) - buffer;
-    const maxLat = Math.max(start.lat, end.lat) + buffer;
-    const minLng = Math.min(start.lng, end.lng) - buffer;
-    const maxLng = Math.max(start.lng, end.lng) + buffer;
-    const bbox = `${minLat},${minLng},${maxLat},${maxLng}`;
-    
-    // Overpass QL query
-    const query = `
-        [out:json][timeout:25];
-        (
-          way${HIGHWAY_FILTER}(bbox:${bbox});
-        );
-        (._;>;);
-        out;`;
-
+    const bbox = `${Math.min(start.lat, end.lat)-buffer},${Math.min(start.lng, end.lng)-buffer},${Math.max(start.lat, end.lat)+buffer},${Math.max(start.lng, end.lng)+buffer}`;
+    const query = `[out:json][timeout:25];(way${HIGHWAY_FILTER}(bbox:${bbox}););(._;>;);out;`;
     const response = await axios.post(OVERPASS_API_URL, `data=${encodeURIComponent(query)}`);
     return response.data;
 }
 
-/**
- * Builds an adjacency list graph from OSM data.
- * @param {object} osmData - The raw data from the Overpass API.
- * @returns {{graph: object, nodes: object}} - The graph and a map of node details.
- */
 function buildGraph(osmData) {
     const nodes = {};
     const graph = {};
 
-    // First pass: collect all node coordinates
     osmData.elements.forEach(el => {
         if (el.type === 'node') {
             nodes[el.id] = { lat: el.lat, lon: el.lon };
@@ -147,37 +134,21 @@ function buildGraph(osmData) {
         }
     });
 
-    // Second pass: build graph edges from ways
     osmData.elements.forEach(el => {
         if (el.type === 'way' && el.nodes) {
             for (let i = 0; i < el.nodes.length - 1; i++) {
                 const nodeA = el.nodes[i];
                 const nodeB = el.nodes[i+1];
-                
-                // Add edge from A to B
-                if (graph[nodeA] && nodes[nodeB]) { // Ensure both nodes exist
-                    graph[nodeA].push(nodeB);
-                }
-
-                // If not a one-way street, add edge from B to A
+                if (graph[nodeA] && nodes[nodeB]) graph[nodeA].push(nodeB);
                 if (el.tags?.oneway !== 'yes') {
-                     if (graph[nodeB] && nodes[nodeA]) { // Ensure both nodes exist
-                        graph[nodeB].push(nodeA);
-                    }
+                     if (graph[nodeB] && nodes[nodeA]) graph[nodeB].push(nodeA);
                 }
             }
         }
     });
-
     return { graph, nodes };
 }
 
-/**
- * Finds the closest node in the graph to a given coordinate.
- * @param {{lat: number, lng: number}} point - The coordinate to match.
- * @param {object} nodes - The map of all nodes from the graph.
- * @returns {string|null} The ID of the closest node.
- */
 function findClosestNode(point, nodes) {
     let closestNodeId = null;
     let minDistance = Infinity;
@@ -195,61 +166,65 @@ function findClosestNode(point, nodes) {
 
 /**
  * The modified A* pathfinding algorithm implementation.
- * @param {string} startId - The ID of the starting node.
- * @param {string} endId - The ID of the destination node.
- * @param {object} graph - The adjacency list of the graph.
- * @param {object} nodes - The map of all nodes with coordinates.
- * @returns {object|null} - An object with the path and total distance, or null if no path is found.
+ * @param {object} config - Configuration object for allowed turns { allowLeft, allowStraight, allowRight, allowUTurn }
  */
-function findPath(startId, endId, graph, nodes) {
+function findPath(startId, endId, graph, nodes, config) {
     const openSet = new PriorityQueue();
     const cameFrom = {};
     const gScore = {};
 
+    // Penalties for different turn types to guide the search
+    const penalties = { left: 1.0, straight: 1.1, right: 1.5, uturn: 2.5 };
+
     const startKey = `${startId}:null`;
     gScore[startKey] = 0;
-    const startHeuristic = haversineDistance(nodes[startId], nodes[endId]);
-    openSet.enqueue({ current: startId, prev: null }, startHeuristic);
+    openSet.enqueue({ current: startId, prev: null }, haversineDistance(nodes[startId], nodes[endId]));
 
     while (!openSet.isEmpty()) {
         const { current, prev } = openSet.dequeue();
         const currentKey = `${current}:${prev}`;
 
         if (current === endId) {
-            // Path found! Reconstruct it.
             const path = reconstructPath(cameFrom, current, prev);
-            const distance = gScore[currentKey] || 0;
-            return { path, distance };
-        }
-
-        const neighbors = graph[current] || [];
-        const availableTurns = [];
-
-        for (const neighbor of neighbors) {
-            if (neighbor === prev) continue;
-
-            if (prev === null) {
-                availableTurns.push({ type: 'straight', neighbor });
-                continue;
-            }
-
-            const angle = calculateTurnAngle(nodes[prev], nodes[current], nodes[neighbor]);
-            
-            if (angle >= LEFT_TURN_ANGLE_MIN && angle <= LEFT_TURN_ANGLE_MAX) {
-                availableTurns.push({ type: 'left', neighbor });
-            } else if (Math.abs(angle) < STRAIGHT_ANGLE_THRESHOLD) {
-                availableTurns.push({ type: 'straight', neighbor });
-            }
+            return { path, distance: gScore[currentKey] || 0 };
         }
         
-        const leftTurns = availableTurns.filter(t => t.type === 'left');
-        const straightTurns = availableTurns.filter(t => t.type === 'straight');
-        const turnsToProcess = leftTurns.length > 0 ? leftTurns : straightTurns;
+        // Consider all neighbors, including going back if U-turns are allowed
+        const neighbors = graph[current] || [];
+        for (const neighbor of neighbors) {
+            let turnType = null;
+            let turnPenalty = Infinity;
 
-        for (const turn of turnsToProcess) {
-            const { neighbor } = turn;
+            // U-Turn Logic
+            if (neighbor === prev) {
+                if (config.allowUTurn) {
+                    turnType = 'uturn';
+                    turnPenalty = penalties.uturn;
+                } else {
+                    continue; // Skip U-turns if not allowed
+                }
+            } 
+            // Logic for all other turns
+            else if (prev === null) {
+                turnType = 'straight'; // First move is always straight
+                turnPenalty = penalties.straight;
+            } else {
+                const angle = calculateTurnAngle(nodes[prev], nodes[current], nodes[neighbor]);
+                if (config.allowLeft && angle >= LEFT_TURN_ANGLE_MIN && angle <= LEFT_TURN_ANGLE_MAX) {
+                    turnType = 'left';
+                    turnPenalty = penalties.left;
+                } else if (config.allowStraight && Math.abs(angle) < STRAIGHT_ANGLE_THRESHOLD) {
+                    turnType = 'straight';
+                    turnPenalty = penalties.straight;
+                } else if (config.allowRight && angle >= RIGHT_TURN_ANGLE_MIN && angle <= RIGHT_TURN_ANGLE_MAX) {
+                    turnType = 'right';
+                    turnPenalty = penalties.right;
+                } else {
+                    continue; // Skip disallowed turn types
+                }
+            }
+
             const distanceToNeighbor = haversineDistance(nodes[current], nodes[neighbor]);
-            const turnPenalty = turn.type === 'straight' ? 1.05 : 1;
             const tentativeGScore = gScore[currentKey] + (distanceToNeighbor * turnPenalty);
             const neighborKey = `${neighbor}:${current}`;
 
@@ -268,66 +243,34 @@ function findPath(startId, endId, graph, nodes) {
 
 // --- HELPER FUNCTIONS ---
 
-/**
- * Calculates Haversine distance between two lat/lon points.
- * @param {{lat: number, lon: number}} p1 - Point 1
- * @param {{lat: number, lon: number}} p2 - Point 2
- * @returns {number} Distance in meters.
- */
 function haversineDistance(p1, p2) {
-    const R = 6371e3; // meters
-    const φ1 = p1.lat * Math.PI/180;
-    const φ2 = p2.lat * Math.PI/180;
+    const R = 6371e3;
+    const φ1 = p1.lat * Math.PI/180, φ2 = p2.lat * Math.PI/180;
     const Δφ = (p2.lat-p1.lat) * Math.PI/180;
     const Δλ = (p2.lon-p1.lon) * Math.PI/180;
-
-    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
-              Math.cos(φ1) * Math.cos(φ2) *
-              Math.sin(Δλ/2) * Math.sin(Δλ/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-
-    return R * c;
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
-/**
- * Calculates the angle of a turn.
- * @param {{lat, lon}} p1 - Previous point.
- * @param {{lat, lon}} p2 - Current point.
- * @param {{lat, lon}} p3 - Next point.
- * @returns {number} The angle in degrees. Negative for left, positive for right.
- */
 function calculateTurnAngle(p1, p2, p3) {
     const bearing1 = Math.atan2(p2.lon - p1.lon, p2.lat - p1.lat);
     const bearing2 = Math.atan2(p3.lon - p2.lon, p3.lat - p2.lat);
-    
     let angle = (bearing2 - bearing1) * (180 / Math.PI);
-    
     if (angle > 180) angle -= 360;
     if (angle < -180) angle += 360;
-    
     return angle;
 }
 
-/**
- * Reconstructs the path from the 'cameFrom' map after A* completes.
- * @param {object} cameFrom - The map of how we reached each node.
- * @param {string} currentId - The final node ID (the destination).
- * @param {string} prevId - The node ID just before the destination.
- * @returns {Array<string>} The reconstructed path of node IDs.
- */
 function reconstructPath(cameFrom, currentId, prevId) {
     const totalPath = [currentId];
     let currentKey = `${currentId}:${prevId}`;
-
     while (cameFrom[currentKey]) {
         const { current, prev } = cameFrom[currentKey];
         totalPath.unshift(current);
         currentKey = `${current}:${prev}`;
     }
-    
     return totalPath.map(String);
 }
-
 
 // --- START SERVER ---
 app.listen(PORT, () => {
