@@ -11,6 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // IMPORTANT: Configure CORS to allow requests from any origin.
+// This is the fix for the CORS error.
 app.use(cors());
 
 app.use(express.json());
