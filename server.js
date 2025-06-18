@@ -11,9 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // IMPORTANT: Configure CORS to allow requests from any origin.
-app.use(cors({
-    origin: '*' // Allow all origins
-}));
+app.use(cors());
 
 app.use(express.json());
 
@@ -74,12 +72,14 @@ app.post('/route', async (req, res) => {
         
         // --- Multi-stage pathfinding ---
         let resultPath = null;
+        let message = "";
         
         // Attempt 1: Strict left-turn only
         console.log('4a. Running A* (Attempt 1: Strict Left/Straight)...');
         resultPath = findPath(startNodeId, endNodeId, graph, nodes, {
             allowLeft: true, allowStraight: true, allowRight: false, allowUTurn: false
         });
+        if(resultPath) message = "Route found using primarily left turns.";
 
         // Attempt 2: Allow U-Turns if first attempt fails
         if (!resultPath) {
@@ -87,6 +87,7 @@ app.post('/route', async (req, res) => {
             resultPath = findPath(startNodeId, endNodeId, graph, nodes, {
                 allowLeft: true, allowStraight: true, allowRight: false, allowUTurn: true
             });
+            if(resultPath) message = "Route found with U-turns allowed.";
         }
         
         // Attempt 3: Allow Right Turns as a last resort
@@ -95,6 +96,7 @@ app.post('/route', async (req, res) => {
             resultPath = findPath(startNodeId, endNodeId, graph, nodes, {
                 allowLeft: true, allowStraight: true, allowRight: true, allowUTurn: true
             });
+            if(resultPath) message = "Route found with right turns as a last resort.";
         }
 
         if (!resultPath) {
@@ -104,7 +106,7 @@ app.post('/route', async (req, res) => {
         console.log('5. Path found! Reconstructing and sending response.');
         const detailedPath = resultPath.path.map(id => ({ lat: nodes[id].lat, lon: nodes[id].lon }));
         const finalPath = [ { lat: start.lat, lng: start.lng }, ...detailedPath.map(p => ({ lat: p.lat, lng: p.lon })), { lat: end.lat, lng: end.lng } ];
-        res.json({ path: finalPath, distance: resultPath.distance });
+        res.json({ path: finalPath, distance: resultPath.distance, message: message });
 
     } catch (error) {
         console.error('Error on /route:', error.stack);
@@ -174,7 +176,7 @@ function findPath(startId, endId, graph, nodes, config) {
     const gScore = {};
 
     // Penalties for different turn types to guide the search
-    const penalties = { left: 1.0, straight: 1.1, right: 1.5, uturn: 2.5 };
+    const penalties = { left: 1.0, straight: 1.1, uturn: 2.5, right: 5.0 };
 
     const startKey = `${startId}:null`;
     gScore[startKey] = 0;
@@ -189,35 +191,25 @@ function findPath(startId, endId, graph, nodes, config) {
             return { path, distance: gScore[currentKey] || 0 };
         }
         
-        // Consider all neighbors, including going back if U-turns are allowed
         const neighbors = graph[current] || [];
         for (const neighbor of neighbors) {
-            let turnType = null;
             let turnPenalty = Infinity;
 
-            // U-Turn Logic
-            if (neighbor === prev) {
+            if (neighbor === prev) { // This is a U-turn
                 if (config.allowUTurn) {
-                    turnType = 'uturn';
                     turnPenalty = penalties.uturn;
                 } else {
-                    continue; // Skip U-turns if not allowed
+                    continue; // Skip if U-turns not allowed
                 }
-            } 
-            // Logic for all other turns
-            else if (prev === null) {
-                turnType = 'straight'; // First move is always straight
+            } else if (prev === null) { // This is the first move
                 turnPenalty = penalties.straight;
             } else {
                 const angle = calculateTurnAngle(nodes[prev], nodes[current], nodes[neighbor]);
                 if (config.allowLeft && angle >= LEFT_TURN_ANGLE_MIN && angle <= LEFT_TURN_ANGLE_MAX) {
-                    turnType = 'left';
                     turnPenalty = penalties.left;
                 } else if (config.allowStraight && Math.abs(angle) < STRAIGHT_ANGLE_THRESHOLD) {
-                    turnType = 'straight';
                     turnPenalty = penalties.straight;
                 } else if (config.allowRight && angle >= RIGHT_TURN_ANGLE_MIN && angle <= RIGHT_TURN_ANGLE_MAX) {
-                    turnType = 'right';
                     turnPenalty = penalties.right;
                 } else {
                     continue; // Skip disallowed turn types
