@@ -10,7 +10,12 @@ const app = express();
 // IMPORTANT: Use the port provided by the hosting environment, or 3000 for local testing.
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// IMPORTANT: Configure CORS to allow requests from any origin.
+// This is necessary for the frontend on Netlify to communicate with the backend on Render.
+app.use(cors({
+    origin: '*' // Allow all origins
+}));
+
 app.use(express.json());
 
 // --- CONSTANTS AND CONFIGURATION ---
@@ -69,7 +74,7 @@ app.post('/route', async (req, res) => {
         }
         
         console.log(`4. Running A* from ${startNodeId} to ${endNodeId}...`);
-        const resultPath = findPath(startNodeId, endNodeId, graph, nodes);
+        const resultPath = findPath(startNodeId, endId, graph, nodes);
 
         if (!resultPath) {
             return res.status(404).json({ message: 'No valid left-turn-only path could be found. This can happen in areas with many one-way streets or where no such path exists.' });
