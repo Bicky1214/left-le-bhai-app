@@ -74,7 +74,7 @@ app.post('/route', async (req, res) => {
         }
         
         console.log(`4. Running A* from ${startNodeId} to ${endNodeId}...`);
-        const resultPath = findPath(startNodeId, endId, graph, nodes);
+        const resultPath = findPath(startNodeId, endNodeId, graph, nodes);
 
         if (!resultPath) {
             return res.status(404).json({ message: 'No valid left-turn-only path could be found. This can happen in areas with many one-way streets or where no such path exists.' });
@@ -203,36 +203,33 @@ function findClosestNode(point, nodes) {
  */
 function findPath(startId, endId, graph, nodes) {
     const openSet = new PriorityQueue();
-    // The "cameFrom" map stores the path. Key is a node ID, value is the node ID it came from.
-    // We need a unique key for each state (current, previous), so we'll use "currentNodeId:previousNodeId"
     const cameFrom = {};
-    // gScore stores the cost (distance) to get to a node.
-    const gScore = {}; // Key: "currentNodeId:previousNodeId"
+    const gScore = {};
 
-    // Initialize scores for the starting node
-    const startKey = `${startId}:null`; // No previous node at the start
+    const startKey = `${startId}:null`;
     gScore[startKey] = 0;
     const startHeuristic = haversineDistance(nodes[startId], nodes[endId]);
     openSet.enqueue({ current: startId, prev: null }, startHeuristic);
 
     while (!openSet.isEmpty()) {
         const { current, prev } = openSet.dequeue();
+        const currentKey = `${current}:${prev}`;
 
         if (current === endId) {
             // Path found! Reconstruct it.
-            return reconstructPath(cameFrom, current, prev, nodes);
+            const path = reconstructPath(cameFrom, current, prev);
+            const distance = gScore[currentKey] || 0;
+            return { path, distance };
         }
 
         const neighbors = graph[current] || [];
         const availableTurns = [];
 
-        // First pass: identify all possible turns (left, straight) from the current node
         for (const neighbor of neighbors) {
-            if (neighbor === prev) continue; // Avoid going back immediately
+            if (neighbor === prev) continue;
 
-            // For the very first step, any direction is fine
             if (prev === null) {
-                availableTurns.push({ type: 'straight', neighbor }); // Treat first move as "straight"
+                availableTurns.push({ type: 'straight', neighbor });
                 continue;
             }
 
@@ -245,23 +242,15 @@ function findPath(startId, endId, graph, nodes) {
             }
         }
         
-        // Prioritize left turns. If any exist, only consider those.
         const leftTurns = availableTurns.filter(t => t.type === 'left');
         const straightTurns = availableTurns.filter(t => t.type === 'straight');
-        
         const turnsToProcess = leftTurns.length > 0 ? leftTurns : straightTurns;
 
-        // Second pass: process the chosen turns
         for (const turn of turnsToProcess) {
             const { neighbor } = turn;
-            const currentKey = `${current}:${prev}`;
             const distanceToNeighbor = haversineDistance(nodes[current], nodes[neighbor]);
-            
-            // Add a slight penalty for going straight to prioritize left turns of similar length
             const turnPenalty = turn.type === 'straight' ? 1.05 : 1;
-            
             const tentativeGScore = gScore[currentKey] + (distanceToNeighbor * turnPenalty);
-            
             const neighborKey = `${neighbor}:${current}`;
 
             if (!gScore[neighborKey] || tentativeGScore < gScore[neighborKey]) {
@@ -321,26 +310,22 @@ function calculateTurnAngle(p1, p2, p3) {
 
 /**
  * Reconstructs the path from the 'cameFrom' map after A* completes.
- * @returns {{path: Array<string>, distance: number}}
+ * @param {object} cameFrom - The map of how we reached each node.
+ * @param {string} currentId - The final node ID (the destination).
+ * @param {string} prevId - The node ID just before the destination.
+ * @returns {Array<string>} The reconstructed path of node IDs.
  */
-function reconstructPath(cameFrom, currentId, prevId, nodes) {
-    const path = [currentId];
-    let totalDistance = 0;
-    
+function reconstructPath(cameFrom, currentId, prevId) {
+    const totalPath = [currentId];
     let currentKey = `${currentId}:${prevId}`;
-    let previousNode = nodes[prevId];
 
     while (cameFrom[currentKey]) {
         const { current, prev } = cameFrom[currentKey];
-        
-        totalDistance += haversineDistance(nodes[path[0]], previousNode); // Add distance of last segment
-        
-        path.unshift(current);
-        previousNode = nodes[prev];
+        totalPath.unshift(current);
         currentKey = `${current}:${prev}`;
     }
     
-    return { path: path.map(String), distance: totalDistance };
+    return totalPath.map(String);
 }
 
 
